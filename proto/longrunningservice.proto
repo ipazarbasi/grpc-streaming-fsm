@@ -1,0 +1,23 @@
+syntax = "proto3";
+package org.ismailp.longrunningtask;
+
+message LongRunningReq {
+  uint64 id = 1;
+}
+
+message TaskStatus {
+  uint64 id = 1;
+  uint64 currentStage = 2;
+  uint64 statusCode = 3;
+}
+
+message LongRunningResp {
+  oneof taskStatus {
+    uint64 numTasks = 1;
+    TaskStatus currentTask = 2;
+  }
+}
+
+service LongRunningService {
+  rpc DoSomething(LongRunningReq) returns (stream LongRunningResp) {}
+}
