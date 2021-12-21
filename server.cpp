@@ -8,13 +8,17 @@
 using namespace grpc;
 using namespace org::ismailp::longrunningtask;
 
-namespace {
+#ifdef __clang__
+#define FALLTHROUGH [[clang::fallthrough]];
+#elif defined(__GNUC__) && __GNUC__ >= 7
+#define FALLTHROUGH __attribute__((fallthrough))
+#else
+#define FALLTHROUGH
+#endif
 
-enum class ServerState {
-  RespondStreamSize,
-  RespondStream,
-  Completed,
-};
+namespace {
+using state_machine::State;
+
 class AsyncServer {
   LongRunningService::AsyncService service;
   std::unique_ptr<grpc::ServerCompletionQueue> cq;
@@ -29,51 +33,64 @@ class AsyncServer {
     LongRunningResp resp;
     ServerAsyncWriter<LongRunningResp> responder;
     grpc::ServerCompletionQueue *cq;
-    ServerState state = ServerState::RespondStreamSize;
-    std::uint64_t currentStage = 0;
+    State state = State::Initial;
 
     explicit Connection(LongRunningService::AsyncService &service,
                         ServerCompletionQueue *cq)
         : responder(&ctx), cq(cq) {
       service.RequestDoSomething(&ctx, &req, &responder, cq, cq, this);
     }
+    bool nextState() {
+      if (state == State::NumStates)
+        return false;
+      auto v = std::underlying_type_t<State>(state);
+      ++v;
+      setState(static_cast<State>(v));
+      return true;
+    }
+    void setState(State newState) {
+      std::cout << "Transitioning from: '" << toString(state) << "' to '"
+                << toString(state) << "'";
+      state = newState;
+    }
     bool handleRequest(LongRunningService::AsyncService &service) {
-      using namespace std::chrono_literals;
       constexpr std::size_t numStates =
           std::underlying_type_t<state_machine::State>(
               state_machine::State::NumStates);
 
       switch (state) {
-      case ServerState::RespondStreamSize: {
+      case State::Initial: {
         std::cout << "Req id: " << req.id() << "\n";
         resp.set_numtasks(numStates);
-        state = ServerState::RespondStream;
+        state = State::Setup;
         responder.Write(resp, this);
-        std::cerr << "Written stream size\n";
         break;
       }
-      case ServerState::RespondStream: {
-        GPR_ASSERT(currentStage < 5);
-        std::this_thread::sleep_for(100ms);
-        resp.Clear();
-        TaskStatus *taskStatus = resp.mutable_currenttask();
-        taskStatus->set_currentstage(++currentStage);
-        taskStatus->set_statuscode(1);
-
-        if (currentStage == 5) {
-          state = ServerState::Completed;
-          responder.WriteAndFinish(resp, {}, Status::OK, this);
-        } else {
-          responder.Write(resp, this);
+      case State::Setup:
+        FALLTHROUGH
+      case State::DataUpload:
+        FALLTHROUGH
+      case State::DataVerify:
+        FALLTHROUGH
+      case State::DataReady:
+        doTheOperation();
+        if (state == State::DataReady) {
+          responder.Finish(Status::OK, this);
         }
-        std::cout << "Written stage: " << currentStage << "\n";
+        break;
+      case State::NumStates:
         break;
       }
-      case ServerState::Completed: {
-        return false;
-      }
-      }
-      return true;
+      return nextState();
+    }
+    void doTheOperation() {
+      using namespace std::chrono_literals;
+      std::this_thread::sleep_for(100ms);
+      resp.Clear();
+      TaskStatus *taskStatus = resp.mutable_currenttask();
+      taskStatus->set_currentstage(std::underlying_type_t<State>(state));
+      taskStatus->set_statuscode(1);
+      responder.Write(resp, this);
     }
   };
 
