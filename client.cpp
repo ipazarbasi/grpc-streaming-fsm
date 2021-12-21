@@ -9,97 +9,101 @@ enum class ClientState {
   RequestStreamSize,
   ReceiveStreamSize,
   Completed,
+  Destroy,
 };
 
 struct Connection {
   LongRunningReq request;
   LongRunningResp reply;
-
   ClientContext context;
 
   Status status;
-  std::unique_ptr<ClientAsyncReader<LongRunningResp>> response_reader;
- };
-
-class Client {
-  CompletionQueue cq_;
-  std::unique_ptr<LongRunningService::Stub> stub_;
-
   std::size_t numStages;
   std::uint64_t id;
   ClientState state;
+  std::unique_ptr<ClientAsyncReader<LongRunningResp>> response_reader;
+  explicit Connection(std::uint64_t id, LongRunningService::Stub &stub,
+                      CompletionQueue *cq)
+      : numStages(0), id(id), state(ClientState::RequestStreamSize) {
+    request.set_id(id);
+    response_reader = stub.PrepareAsyncDoSomething(&context, request, cq);
+    response_reader->StartCall(this);
+  }
+  bool handleMessage();
+  void receiveStreamSize();
+};
 
-  void receiveStreamSize(void *);
+class Client {
+  CompletionQueue cq;
+  std::unique_ptr<LongRunningService::Stub> stub;
+  std::uint64_t id;
 
 public:
   explicit Client(std::shared_ptr<Channel> channel)
-      : stub_(LongRunningService::NewStub(channel)), numStages(0), id(4),
-        state(ClientState::RequestStreamSize) {}
+      : stub(LongRunningService::NewStub(channel)), id(0) {}
   void asyncHandleCall();
   void prepareCall();
 };
 
-void Client::prepareCall() {
-  auto req_ptr = new Connection;
-  req_ptr->request.set_id(id++);
-
-  state = ClientState::RequestStreamSize;
-  req_ptr->response_reader =
-      stub_->PrepareAsyncDoSomething(&req_ptr->context, req_ptr->request, &cq_);
-  req_ptr->response_reader->StartCall(req_ptr);
-}
+void Client::prepareCall() { new Connection(id++, *stub, &cq); }
 
 void Client::asyncHandleCall() {
-  void *tag;
+  void *tag = nullptr;
   bool ok = false;
 
-  while (cq_.Next(&tag, &ok)) {
-    auto *call = static_cast<Connection *>(tag);
+  while (cq.Next(&tag, &ok)) {
     GPR_ASSERT(tag);
-    switch (state) {
-    case ClientState::RequestStreamSize: {
-      state = ClientState::ReceiveStreamSize;
-      call->response_reader->Read(&call->reply, tag);
-      break;
-    }
-    case ClientState::ReceiveStreamSize: {
-      receiveStreamSize(tag);
-      break;
-    }
-    case ClientState::Completed: {
-      delete call;
-      while (cq_.Next(&tag, &ok));
+    auto *call = static_cast<Connection *>(tag);
+    if (!call->handleMessage())
       return;
-    }
-    }
   }
 }
 
-void Client::receiveStreamSize(void *tag) {
+bool Connection::handleMessage() {
+  switch (state) {
+  case ClientState::RequestStreamSize: {
+    state = ClientState::ReceiveStreamSize;
+    response_reader->Read(&reply, this);
+    return true;
+  }
+  case ClientState::ReceiveStreamSize: {
+    receiveStreamSize();
+    return true;
+  }
+  case ClientState::Completed: {
+    state = ClientState::Destroy;
+    response_reader->Finish(&status, this);
+    return true;
+  }
+  case ClientState::Destroy:
+    delete this;
+    return false;
+  }
+  std::cerr << "unreachable has been reached\n";
+  std::terminate();
+}
+
+void Connection::receiveStreamSize() {
   GPR_ASSERT(numStages == 0);
-  auto *call2 = static_cast<Connection *>(tag);
-  call2->response_reader->Read(&call2->reply, tag);
-  switch (call2->reply.taskStatus_case()) {
+  response_reader->Read(&reply, this);
+  switch (reply.taskStatus_case()) {
   case LongRunningResp::TaskStatusCase::kNumTasks:
     std::cout << "num tasks received\n"
-              << "Num tasks: " << call2->reply.numtasks() << "\n";
+              << "Num tasks: " << reply.numtasks() << "\n";
     break;
   case LongRunningResp::TaskStatusCase::kCurrentTask: {
-    const auto &currentTask = call2->reply.currenttask();
+    const auto &currentTask = reply.currenttask();
     std::cout << "current task received\n"
               << "Current stage: " << currentTask.currentstage() << " "
               << "Status code: " << currentTask.statuscode() << "\n";
-    if (currentTask.currentstage() == 5) {
+    if (currentTask.currentstage() == 5)
       state = ClientState::Completed;
-      call2->response_reader->Finish(&call2->status, nullptr);
-    }
     break;
   }
   case LongRunningResp::TaskStatusCase::TASKSTATUS_NOT_SET:
     std::cout << "TASK STATUS NOT SET\n";
     break;
   }
-  std::cout.flush();
 }
 
 } // namespace

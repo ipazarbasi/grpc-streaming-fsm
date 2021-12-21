@@ -1,7 +1,9 @@
 #include "longrunningservice.grpc.pb.h"
+#include "state_machine_types.h"
 #include <chrono>
 #include <future>
 #include <grpcpp/grpcpp.h>
+#include <type_traits>
 
 using namespace grpc;
 using namespace org::ismailp::longrunningtask;
@@ -35,13 +37,16 @@ class AsyncServer {
         : responder(&ctx), cq(cq) {
       service.RequestDoSomething(&ctx, &req, &responder, cq, cq, this);
     }
-    void handleRequest(LongRunningService::AsyncService &service) {
+    bool handleRequest(LongRunningService::AsyncService &service) {
       using namespace std::chrono_literals;
+      constexpr std::size_t numStates =
+          std::underlying_type_t<state_machine::State>(
+              state_machine::State::NumStates);
 
       switch (state) {
       case ServerState::RespondStreamSize: {
         std::cout << "Req id: " << req.id() << "\n";
-        resp.set_numtasks(5);
+        resp.set_numtasks(numStates);
         state = ServerState::RespondStream;
         responder.Write(resp, this);
         std::cerr << "Written stream size\n";
@@ -65,13 +70,12 @@ class AsyncServer {
         break;
       }
       case ServerState::Completed: {
-        delete this;
+        return false;
       }
       }
+      return true;
     }
   };
-
-  std::vector<std::unique_ptr<Connection>> connections;
 
 public:
   void start() {
@@ -88,15 +92,17 @@ public:
 };
 
 void AsyncServer::processMessages() {
-  connections.emplace_back(std::make_unique<Connection>(service, cq.get()));
+  new Connection(service, cq.get());
   while (true) {
     void *tag;
     bool ok;
-    if (cq->Next(&tag, &ok)) {
-      if (tag) {
-        Connection *conn = static_cast<Connection *>(tag);
-        conn->handleRequest(service);
-      }
+    if (!cq->Next(&tag, &ok))
+      continue;
+    if (!tag)
+      continue;
+    Connection *conn = static_cast<Connection *>(tag);
+    if (not conn->handleRequest(service)) {
+      return;
     }
   }
 }
