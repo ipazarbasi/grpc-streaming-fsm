@@ -30,7 +30,7 @@ struct Connection {
     response_reader->StartCall(this);
   }
   bool handleMessage();
-  void receiveStreamSize();
+  void observeRemoteFSM();
 };
 
 class Client {
@@ -67,7 +67,7 @@ bool Connection::handleMessage() {
     return true;
   }
   case ClientState::ReceiveStreamSize: {
-    receiveStreamSize();
+    observeRemoteFSM();
     return true;
   }
   case ClientState::Completed: {
@@ -83,7 +83,7 @@ bool Connection::handleMessage() {
   std::terminate();
 }
 
-void Connection::receiveStreamSize() {
+void Connection::observeRemoteFSM() {
   GPR_ASSERT(numStages == 0);
   response_reader->Read(&reply, this);
   switch (reply.taskStatus_case()) {
