@@ -3,21 +3,17 @@
 #include <chrono>
 #include <future>
 #include <grpcpp/grpcpp.h>
-#include <type_traits>
 
 using namespace grpc;
 using namespace org::ismailp::longrunningtask;
-
-#ifdef __clang__
-#define FALLTHROUGH [[clang::fallthrough]];
-#elif defined(__GNUC__) && __GNUC__ >= 7
-#define FALLTHROUGH __attribute__((fallthrough))
-#else
-#define FALLTHROUGH
-#endif
+using namespace state_machine;
 
 namespace {
-using state_machine::State;
+
+std::ostream &printOutput(std::ostream &stm) {
+  stm << "server: ";
+  return stm;
+}
 
 class AsyncServer {
   LongRunningService::AsyncService service;
@@ -27,32 +23,24 @@ class AsyncServer {
 
   void processMessages();
 
-  struct Connection {
+  /// Represents one connection (request).
+  struct Connection : public BasicStateMachine<Connection> {
     ServerContext ctx;
     LongRunningReq req;
     LongRunningResp resp;
     ServerAsyncWriter<LongRunningResp> responder;
     grpc::ServerCompletionQueue *cq;
-    State state = State::Initial;
 
     explicit Connection(LongRunningService::AsyncService &service,
                         ServerCompletionQueue *cq)
         : responder(&ctx), cq(cq) {
       service.RequestDoSomething(&ctx, &req, &responder, cq, cq, this);
     }
-    bool nextState() {
-      if (state == State::NumStates)
-        return false;
-      auto v = std::underlying_type_t<State>(state);
-      ++v;
-      setState(static_cast<State>(v));
-      return true;
+
+    std::ostream &printOutputImpl(std::ostream &stm) const {
+      return ::printOutput(stm);
     }
-    void setState(State newState) {
-      std::cout << "Transitioning from: '" << toString(state) << "' to '"
-                << toString(state) << "'";
-      state = newState;
-    }
+
     bool handleRequest(LongRunningService::AsyncService &service) {
       constexpr std::size_t numStates =
           std::underlying_type_t<state_machine::State>(
@@ -60,9 +48,10 @@ class AsyncServer {
 
       switch (state) {
       case State::Initial: {
-        std::cout << "Req id: " << req.id() << "\n";
+        printOutput(std::cout) << "Req id: " << req.id() << "\n";
+        // Set the number of possible states. This could be bound to a more
+        // dynamic structure, like a vector or map of states.
         resp.set_numtasks(numStates);
-        state = State::Setup;
         responder.Write(resp, this);
         break;
       }
@@ -73,12 +62,16 @@ class AsyncServer {
       case State::DataVerify:
         FALLTHROUGH
       case State::DataReady:
+        // Since the server doesn't really do any operation, all states end up
+        // calling this, wasting CPU cycles for some time, and then moving on.
         doTheOperation();
         if (state == State::DataReady) {
+          // Server has reached its final state, and the streaming is finished.
           responder.Finish(Status::OK, this);
         }
         break;
-      case State::NumStates:
+      case State::NumStates: // no more transitions, and nextState should return
+                             // false.
         break;
       }
       return nextState();
@@ -90,6 +83,8 @@ class AsyncServer {
       TaskStatus *taskStatus = resp.mutable_currenttask();
       taskStatus->set_currentstage(std::underlying_type_t<State>(state));
       taskStatus->set_statuscode(1);
+      printOutput(std::cout)
+          << "Sending status at state: " << toString(state) << "\n";
       responder.Write(resp, this);
     }
   };

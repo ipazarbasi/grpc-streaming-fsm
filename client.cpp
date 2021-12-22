@@ -1,18 +1,15 @@
 #include "longrunningservice.grpc.pb.h"
+#include "state_machine_types.h"
 #include <grpcpp/grpcpp.h>
+#include <type_traits>
 
 using namespace grpc;
 using namespace org::ismailp::longrunningtask;
+using namespace state_machine;
 
 namespace {
-enum class ClientState {
-  RequestStreamSize,
-  ReceiveStreamSize,
-  Completed,
-  Destroy,
-};
 
-struct Connection {
+struct Connection : public BasicStateMachine<Connection> {
   LongRunningReq request;
   LongRunningResp reply;
   ClientContext context;
@@ -20,17 +17,22 @@ struct Connection {
   Status status;
   std::size_t numStages;
   std::uint64_t id;
-  ClientState state;
   std::unique_ptr<ClientAsyncReader<LongRunningResp>> response_reader;
+  bool expectingServerState;
   explicit Connection(std::uint64_t id, LongRunningService::Stub &stub,
                       CompletionQueue *cq)
-      : numStages(0), id(id), state(ClientState::RequestStreamSize) {
+      : numStages(0), id(id), expectingServerState(false) {
     request.set_id(id);
     response_reader = stub.PrepareAsyncDoSomething(&context, request, cq);
     response_reader->StartCall(this);
   }
   bool handleMessage();
   void observeRemoteFSM();
+
+  std::ostream &printOutputImpl(std::ostream &stm) const {
+    stm << "client: ";
+    return stm;
+  }
 };
 
 class Client {
@@ -50,37 +52,33 @@ void Client::prepareCall() { new Connection(id++, *stub, &cq); }
 void Client::asyncHandleCall() {
   void *tag = nullptr;
   bool ok = false;
+  bool hasNext = true;
 
-  while (cq.Next(&tag, &ok)) {
+  while (hasNext && cq.Next(&tag, &ok)) {
     GPR_ASSERT(tag);
     auto *call = static_cast<Connection *>(tag);
-    if (!call->handleMessage())
-      return;
+    hasNext = call->handleMessage();
   }
 }
 
 bool Connection::handleMessage() {
-  switch (state) {
-  case ClientState::RequestStreamSize: {
-    state = ClientState::ReceiveStreamSize;
-    response_reader->Read(&reply, this);
-    return true;
+  if (not expectingServerState) {
+    if (state == State::Initial) {
+      response_reader->Read(&reply, this);
+      expectingServerState = true;
+      return true;
+    } else {
+      delete this;
+      return false;
+    }
   }
-  case ClientState::ReceiveStreamSize: {
-    observeRemoteFSM();
-    return true;
-  }
-  case ClientState::Completed: {
-    state = ClientState::Destroy;
+
+  observeRemoteFSM();
+  if (state == State::DataReady) {
     response_reader->Finish(&status, this);
-    return true;
+    expectingServerState = false;
   }
-  case ClientState::Destroy:
-    delete this;
-    return false;
-  }
-  std::cerr << "unreachable has been reached\n";
-  std::terminate();
+  return true;
 }
 
 void Connection::observeRemoteFSM() {
@@ -88,20 +86,27 @@ void Connection::observeRemoteFSM() {
   response_reader->Read(&reply, this);
   switch (reply.taskStatus_case()) {
   case LongRunningResp::TaskStatusCase::kNumTasks:
-    std::cout << "num tasks received\n"
-              << "Num tasks: " << reply.numtasks() << "\n";
+    printOutput(std::cout) << "Num states: " << reply.numtasks() << "\n";
     break;
   case LongRunningResp::TaskStatusCase::kCurrentTask: {
+    constexpr auto numStates = std::underlying_type_t<State>(State::NumStates);
     const auto &currentTask = reply.currenttask();
-    std::cout << "current task received\n"
-              << "Current stage: " << currentTask.currentstage() << " "
-              << "Status code: " << currentTask.statuscode() << "\n";
-    if (currentTask.currentstage() == 5)
-      state = ClientState::Completed;
+    auto curRemoteStateInt = currentTask.currentstage();
+    if (numStates < curRemoteStateInt) {
+      printOutput(std::cerr) << "invalid server state\n";
+      std::terminate();
+    }
+    State curRemoteState = static_cast<State>(curRemoteStateInt);
+    printOutput(std::cout) << "current state received\n"
+                           << "  Current server state: "
+                           << toString(curRemoteState) << " "
+                           << "  Status code: " << currentTask.statuscode()
+                           << "\n";
+    setState(curRemoteState);
     break;
   }
   case LongRunningResp::TaskStatusCase::TASKSTATUS_NOT_SET:
-    std::cout << "TASK STATUS NOT SET\n";
+    printOutput(std::cout) << "TASK STATUS NOT SET\n";
     break;
   }
 }
